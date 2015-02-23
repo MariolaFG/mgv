@@ -114,7 +114,8 @@ class ReadString(npyscreen.FixedText):
                 column += width_of_char_to_print
                 place_in_string += 1
 
-SPLIT_TAG = re.compile("([ACTG]| +)")                
+#SPLIT_TAG = re.compile("([ACTG]| +)")
+SPLIT_TAG = re.compile("(A+|C+|T+|G+| +|_+)")
 class SeqView(npyscreen.MultiLine):
     _contained_widgets = ReadString
 
@@ -155,6 +156,8 @@ class SeqView(npyscreen.MultiLine):
                     continue
                 elif chunk[0] == " ":
                     pair = blank
+                elif chunk[0] == "_":
+                    pair = yellow
                 elif chunk == "A":
                     pair = red if not hl else h_red
                 elif chunk == "C":

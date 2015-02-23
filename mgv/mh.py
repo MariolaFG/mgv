@@ -19,6 +19,7 @@ except:
     DEBUG = False
 else:
     print "DEBUG MODE, process reads:", DEBUG
+    
 if sys.argv[1] == "falk":
     FALK = True
     CONTIG="S4__C0_L=313228;"
@@ -38,6 +39,7 @@ else:
     REFSEQ = contig_db.find_one({"sp":TAXID, "c":CONTIG}, {"nt"})["nt"]
     BAMFILE = sys.argv[1]
 
+    
 print "Loading reads"
 samfile = pysam.AlignmentFile(BAMFILE, "rb" )
 paired_reads = {}
@@ -61,7 +63,6 @@ print len([p for p in paired_reads.itervalues() if len(p) == 1]), "== 1"
 print len([p for p in paired_reads.itervalues() if len(p) == 2]), "== 2"
 print len([p for p in paired_reads.itervalues() if len(p) > 2]), " >2 "
 
-
 # calling paired alleles
 alleles = defaultdict(list)
 
@@ -75,13 +76,14 @@ def sort_alleles(alist, a, reverse=True):
 
 snps = defaultdict(int)
 multi_alg = 0
+MIN_QUALITY = 13
 for nread, pair in enumerate(paired_reads.itervalues()):
     if nread % 1000 == 0:
-        if nread % 10000 == 0:
-            temp = sort_alleles(alleles, alleles)
-            if temp:
-                for x in temp[:10]:
-                    print "       ", x, alleles[x]
+        if nread % 100000 == 0:
+            #temp = sort_alleles(alleles, alleles)
+            #if temp:
+            #    for x in temp[:10]:
+            #        print "       ", x, alleles[x]
             print "\r% 8d Alleles % 5d, max_size: % 2d, snps: % 7d" %(nread, len(alleles), max([0] + [len(s) for s in alleles]), len(snps)),
         else:
             print "\r% 8d" %(nread),
@@ -94,7 +96,7 @@ for nread, pair in enumerate(paired_reads.itervalues()):
         var = []
         gvar = []
         for i, x in enumerate(read.query_alignment_sequence):
-            if x != seq[i]:
+            if x != seq[i] and read.query_qualities[i] >= MIN_QUALITY:
                 if 0:
                     var.append((i, x))
                 gcoord = i + read.reference_start
@@ -111,18 +113,21 @@ for nread, pair in enumerate(paired_reads.itervalues()):
     if len(hap)>1:
         hap_key = frozenset(hap)
         alleles[hap_key].append(covered_regions)
-
-        
+       
     if DEBUG and nread == DEBUG:
         break
 print "\r% 8d Alleles % 5d, max_size: % 2d, snps: % 7d" %(nread, len(alleles), max([0] + [len(s) for s in alleles]), len(snps))
 
-MIN_COMMON_SNPS_TO_MERGE = 2
+MIN_COMMON_SNPS_TO_MERGE = 1
+MIN_SNP_COV = 1
+
 def are_compatible_hap(a, regs_a, b, regs_b):
     def overalp_reg(ra, rb):
         return min(ra[1], rb[1]) - max(ra[0], rb[0]) >= 0
     
     common_snps = a & b
+    common_snps = [pos for pos in common_snps if snps[pos] >= MIN_SNP_COV]
+    
     if len(common_snps) < MIN_COMMON_SNPS_TO_MERGE:
         return False
     else:
@@ -157,8 +162,8 @@ def print_alleles(alleles_group, alleles):
             sys.stdout.write(pos[1])
         else:
             sys.stdout.write("-") 
-    print "  % 2d" %len(alleles[alleles_group[0]])
-
+    #print "  % 2d" %len(alleles[alleles_group[0]])
+    print 
     # this are expected to be the merged alleles
     for b in alleles_group[1:]:
         for pos in all_pos:
@@ -166,7 +171,8 @@ def print_alleles(alleles_group, alleles):
                 sys.stdout.write(pos[1])
             else:
                 sys.stdout.write("-")
-        print "  % 2d" %len(alleles[b])
+        #print "  % 2d" %len(alleles[b])
+        print 
     for pos in all_pos:
         sys.stdout.write(pos[1])
     print "  MERGED" 
@@ -183,15 +189,20 @@ while s_alleles:
     temp_a_regs = a_regs
     
     compatible_b = []
-    size = len(s_alleles)
-    for index, b in enumerate(reversed(s_alleles)):
-        b_regs = alleles[b]
-        if are_compatible_hap(temp_a, temp_a_regs, b, b_regs):
-            temp_a = temp_a | b
-            temp_a_regs = temp_a_regs + b_regs
-            compatible_b.append(b)
-            del s_alleles[(size - index)-1]
-            
+    nocomp = False
+    while nocomp == False:
+        nocomp = True
+        size = len(s_alleles)
+        for index, b in enumerate(reversed(s_alleles)):
+            b_regs = alleles[b]
+            if are_compatible_hap(temp_a, temp_a_regs, b, b_regs):
+                temp_a = temp_a | b
+                temp_a_regs = temp_a_regs + b_regs
+                compatible_b.append(b)
+                del s_alleles[(size - index)-1]
+                nocomp = False
+                break
+                
     if compatible_b:
         merged_alleles.append([a] + compatible_b)
         #print_alleles(merged_alleles[-1], alleles)
@@ -216,16 +227,30 @@ def global_region(target, alleles):
                     max_pos = reg[1]
     return min_pos, max_pos            
 
-def view_reads(target, alleles, ref):
+def view_reads(target, alleles, ref, groups=None):
+    break_points = {}
+    if groups:
+        target = []
+        for gr in groups:
+            target.extend(gr)
+            break_points[len(target)-1] = str(gr)
+    print
+    
+    print len(break_points), break_points.keys(), "break_points"
+    print len(groups)
+    raw_input()
+
     min_pos, max_pos = global_region(target, alleles)
     refseq = ref[min_pos:max_pos]
     
     lines = []
-    for a in target:
+    group_lines = []
+    group_hap = set()
+    for aindex, a in enumerate(target):
         hap_variants = dict(a)
         for hap in alleles[a]:
             read_seq = [" "] * len(refseq)
-            min_read_start = 0
+            min_read_start = None
             for reg in hap:
                 if min_read_start is None or reg[0] < min_read_start:
                     min_read_start = reg[0]
@@ -235,12 +260,29 @@ def view_reads(target, alleles, ref):
                             read_seq[i - min_pos] = hap_variants[i]
                         else:
                             read_seq[i - min_pos] = "-"
-            lines.append([min_read_start, ''.join(read_seq)])
+            group_lines.append([min_read_start, ''.join(read_seq)])
+        group_hap.add(a)
+        if aindex in break_points:
+            #group_lines.append([len(refseq), '____%s'%sorted(group_hap)+'_'*len(refseq)])
+            group_lines.append([len(refseq), '_'*len(refseq)])
+            group_lines.sort()
+            lines.append(group_lines)
+            for x in group_lines:
+                print x
+            raw_input()
+            group_lines = []
+            group_hap = set()
 
+    if group_lines:
+        group_lines.sort()
+        lines.append(group_lines)
+        
+    lines.sort()
+    flat_lines = [ln[1] for sublist in lines for ln in sublist]                     
     hap_length = len(set([val for sublist in m for val in sublist]))
     title = "%d:%d (%dbp), read-pairs:%d, hap_length:%d" %(min_pos, max_pos, max_pos-min_pos, len(m), hap_length)
-    lines.sort(reverse=True)
-    readview.view([refseq] + [ln[1] for ln in lines], title)
+    
+    readview.view([refseq] + flat_lines, title)
 
     
 import numpy
@@ -257,8 +299,46 @@ print "median", numpy.median(lengths)
 print ">1 ", len([s for s in lengths if s>1])
 
 
+# Merging merged
 
-for m in (_m for  _l,_s,_m in sorted(zip(lengths, sizes, merged_alleles), reverse=True)):
+merged_alleles = [_m for  _l,_s,_m in sorted(zip(lengths, sizes, merged_alleles), reverse=True)]
+compatibles = []
+used = set()
+for i in xrange(len(merged_alleles)):
+    print '\r 6d', i, 
+    ma = set()
+    [ma.update(a) for a in merged_alleles[i]]
+    comp = []
+    for j in xrange(i, len(merged_alleles)):
+        if i != j:
+            mb = set()
+            [mb.update(a) for a in merged_alleles[j]]
+            if len(ma & mb) > 0:
+                comp.append(merged_alleles[j])
+                
+    if len(comp) >= 7:
+        #print_alleles(merged_alleles[i]+comp, alleles)
+        groups =  [b for b in comp]
+        groups.append(merged_alleles[i])
+        print 
+        print len(groups), "groups"
+        raw_input()
+        view_reads(target=None, groups = groups, alleles=alleles, ref=REFSEQ)
+        print
+        
+    compatibles.append(len(comp))
+print
+
+print numpy.max(compatibles)
+print numpy.min(compatibles)
+print numpy.mean(compatibles)
+print len([_ for _ in compatibles if _==0])
+print len([_ for _ in compatibles if _==1])
+print len([_ for _ in compatibles if _>1])
+raw_input()
+
+# Visualize
+for m in merged_alleles:
     minpos, maxpos = global_region(m, alleles)
     print minpos, maxpos, maxpos-minpos
     print "alleles", len(m)
