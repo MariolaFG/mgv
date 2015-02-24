@@ -2,8 +2,10 @@ import sys
 from glob import glob
 from collections import defaultdict
 from argparse import ArgumentParser
+import time
+import cPickle
 
-import numpy
+#import numpy
 from pymongo import MongoClient
 import pysam
 
@@ -94,73 +96,80 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
             r = cmp(len(haplotype2regions[hap1]), len(haplotype2regions[hap1]))
         return r
   
-    merged_haplotypes = []
+
     haplotypes_list = haplotype2regions.keys()
     haplotypes_list.sort(sort_haplotypes, reverse=True)
-    cycles = 0
+
+    print 'Flattening genomic regions'
+    flattened_regions = []
+    for hap in haplotypes_list:
+        flat_regs = []
+        [flat_regs.extend(reg) for reg in haplotype2regions[hap]]
+        flattened_regions.append(flat_regs)
+
     visited = set()
-    while haplotypes_list:
-        cycles += 1
+    merged_haplotypes = 0
+    hap_sizes = []
+    t1 = time.time()
+    for i, current_hap in enumerate(haplotypes_list):
+        if i in visited: continue
         
-        # extract first (smallest haplotype)
-        #current_hap = haplotypes_list.pop()
-        current_hap = haplotypes_list[0]
-        haplotypes_list = haplotypes_list[1:]
+        visited.add(i)
         
-        current_hap_regs = haplotype2regions[current_hap]
-        #print current_hap, len(current_hap_regs)
+        compatible_haps = [i]
+        query_hap = set(current_hap)
+        query_hap_regs = list(flattened_regions[i])
+        for j, target_hap in enumerate(haplotypes_list[i:]):
+            orig_pos = j + i
+            if orig_pos in visited: continue
+            target_hap_regs = flattened_regions[orig_pos]
+            if mergeable_haplotypes(query_hap, query_hap_regs,
+                                    target_hap, target_hap_regs,
+                                    snp2coverage, 
+                                    min_snp_coverage,
+                                    min_anchoring_snps):
+
+                # if compatible, build a merged haplotype and continue
+                # searching
+                visited.add(orig_pos)
+                query_hap.update(target_hap)
+                query_hap_regs.extend(target_hap_regs)
+                compatible_haps.append(orig_pos)
+                
+        merged_haplotypes += 1
+        hap_sizes.append(len(query_hap))
+
+        yield [haplotypes_list[x] for x in compatible_haps], query_hap, query_hap_regs
         
-        compatible_haps = []
-        search_compatibles = True
-        query_hap = current_hap
-        query_hap_regs = current_hap_regs
-        while search_compatibles:
-            cycles += 1
-            search_compatibles = False
-            size = len(haplotypes_list)
-            for index, target_hap in enumerate(haplotypes_list): # reverse?
-                target_hap_regs = haplotype2regions[target_hap]
-                if mergeable_haplotypes(query_hap, query_hap_regs,
-                                        target_hap, target_hap_regs,
-                                        snp2coverage, 
-                                        min_snp_coverage,
-                                        min_anchoring_snps):
-                    # if compatible, build a merged haplotype and continue
-                    # searching
-                    query_hap = query_hap | target_hap
-                    query_hap_regs = query_hap_regs + target_hap_regs
-                    compatible_haps.append(target_hap)
-                    #del haplotypes_list[(size - index)-1]
-                    #del haplotypes_list[index]
-                    haplotypes_list = [e for j, e in enumerate(haplotypes_list) if j != index]
-                    
-                    search_compatibles = True
-                    break
-                    
-        compatible_haps.append(current_hap)
-        merged_haplotypes.append(compatible_haps)
-        if cycles % 1000 == 0:
-            snp_count = [len(get_merged(x)) for x in merged_haplotypes]
-            print "\r   Haps left:%d merged:%d, sizes:%d-%d median-size:%d" %(len(haplotypes_list),
-                                                                              len(merged_haplotypes),
-                                                                              max(snp_count),
-                                                                              min(snp_count),
-                                                                              numpy.median(snp_count))
-            sys.stdout.flush()                                                                    
+        if i % 1000 == 0:
+            print "     scanned:%d merged:%d, sizes:%d-%d median-size:%d time:%d/s" %(len(visited),
+                                                                                       merged_haplotypes,
+                                                                                       max(hap_sizes),
+                                                                                       min(hap_sizes),
+                                                                                       0,
+                                                                                       1000 * (time.time()-t1))
+            sys.stdout.flush()
+            t1 = time.time()
             #print_haplotypes(compatible_haps, haplotype2regions)
 
-            
-    snp_count = [len(get_merged(x)) for x in merged_haplotypes]
-    print "\r   Haps left:%d merged:%d, sizes:%d-%d median-size:%d" %(len(haplotypes_list),
-                                                                      len(merged_haplotypes),
-                                                                      max(snp_count),
-                                                                      min(snp_count),
-                                                                      numpy.median(snp_count))
 
-    crappyhist(snp_count, max(snp_count))
-    return merged_haplotypes
+    print "     scanned:%d merged:%d, sizes:%d-%d median-size:%d time:%d/s" %(len(visited),
+                                                                              merged_haplotypes,
+                                                                              max(hap_sizes),
+                                                                              min(hap_sizes),
+                                                                              0,
+                                                                              1000 * (time.time()-t1))
+
+    #crappyhist(snp_count, max(snp_count))
+    #return merged_haplotypes
 
 
+def flatten_snps(items, haplotypes):
+    unique_snps = set()
+    map(lambda i: unique_snps.update(haplotypes[i]), items)
+    return unique_snps
+   
+    
 def crappyhist(a, bins):
     '''Draws a crappy text-mode histogram of an array'''
     import numpy as np
@@ -240,35 +249,31 @@ def view_reads(target, alleles, ref, groups=None):
     
     readview.view([refseq] + flat_lines, title)
 
-    
-def get_merged(haplotypes):
-    unique_snps = set()
-    for hap in haplotypes:
-        unique_snps.update(hap)
-    return unique_snps
+  
 
     
-def mergeable_haplotypes(a, regs_a, b, regs_b, snp2coverage, min_snp_coverage, min_anchoring_snps):
+def mergeable_haplotypes(a, flat_regs_a, b, flat_regs_b, snp2coverage, min_snp_coverage, min_anchoring_snps):
     '''Returns True if two haplotypes (composed of a series of SNP coords) could be
     merged, meaning that they are probably from the same DNA fragment.
     '''
     
     def overlap_reg(ra, rb):
         '''Returns the overalp of two genomic regions''' 
-        return min(ra[1], rb[1]) - max(ra[0], rb[0]) >= 0
+        return (min(ra[1], rb[1]) - max(ra[0], rb[0])) >= 0
 
     # builds a list of snps present both in a and b haplotypes
-    common_snps = [snp for snp in (a & b) if snp2coverage[snp] >= min_snp_coverage]
+    common_snps = [snp for snp in a & b if snp2coverage[snp] >= min_snp_coverage]
         
     if len(common_snps) < min_anchoring_snps:
         return False
     else:
-        flat_regs_b = []
-        [flat_regs_b.extend(breg) for breg in regs_b]
-        flat_regs_a = []
-        [flat_regs_a.extend(areg) for areg in regs_a]
+        #flat_regs_b = []
+        #[flat_regs_b.extend(breg) for breg in regs_b]
+        #flat_regs_a = []
+        #[flat_regs_a.extend(areg) for areg in regs_a]
         
-        # check for incompatibilities between the 
+        # does any SNP in one profile overlap with the sampled region of the
+        # other haplotype?
         for unique_a in a - b:
             for rb in flat_regs_b:
                 if overlap_reg((unique_a[0], unique_a[0]), rb):
@@ -314,22 +319,20 @@ def main(args):
             haplotype2regions, snp_cov = get_paired_haplotypes(paired_reads, refseq, 
                                                               min_site_quality=args.min_site_quality,
                                                               min_snps_in_haplotype=args.min_snps_in_haplotype)
-            merged = merge_haplotypes(haplotype2regions, snp_cov,
-                             min_anchoring_snps=args.min_anchoring_snps,
-                             min_snp_coverage=args.min_snp_coverage)
+            merged = []
+            for hap_group, merged_snps, flatten_regs in merge_haplotypes(haplotype2regions, snp_cov,
+                                                                         min_anchoring_snps=args.min_anchoring_snps,
+                                                                         min_snp_coverage=args.min_snp_coverage):
+                merged.append([hap_group, merged_snps, flatten_regs])
 
-
+                if args.view:
+                    #print_haplotypes(hap_group, refseq)
+                    #raw_input()
+                    view_reads(hap_group, haplotype2regions, refseq)
+                
             if args.output:
-                import cPickle
                 cPickle.dump(merged, open(args.output, "w"))
 
-            # Visualize
-            # for m in merged:
-            #     print_haplotypes(m, refseq)
-            #     raw_input()
-            #     view_reads(m, haplotype2regions, refseq)
-            #     print
-    
                 
 
             
@@ -346,6 +349,7 @@ if __name__ == '__main__':
     parser.add_argument('--min_anchoring_snps', dest='min_anchoring_snps', default=2, type=int)
     parser.add_argument('--min_snps_in_haplotype', dest='min_snps_in_haplotype', default=2, type=int)
     parser.add_argument('--output', dest='output')
+    parser.add_argument('--view', dest='view', action='store_true')
     args = parser.parse_args()
     main(args)
 
