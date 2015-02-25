@@ -4,7 +4,7 @@ from collections import defaultdict
 from argparse import ArgumentParser
 import time
 import cPickle
-
+from pprint import pprint
 #import numpy
 from pymongo import MongoClient
 import pysam
@@ -12,7 +12,7 @@ import pysam
 import readview
 
 # Database pointers
-mongo = MongoClient()
+mongo = MongoClient('pc-bork62')
 snp_db =  mongo.metagenvar_filtered.snp
 sites_db =  mongo.metagenvar_filtered.sites
 samples_db = mongo.metagenvar_filtered.samples
@@ -96,7 +96,6 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
             r = cmp(len(haplotype2regions[hap1]), len(haplotype2regions[hap1]))
         return r
   
-
     haplotypes_list = haplotype2regions.keys()
     haplotypes_list.sort(sort_haplotypes, reverse=True)
 
@@ -111,6 +110,9 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
     merged_haplotypes = 0
     hap_sizes = []
     t1 = time.time()
+    scanned = 0
+    log_scanned = 0
+   
     for i, current_hap in enumerate(haplotypes_list):
         if i in visited: continue
         
@@ -119,9 +121,12 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
         compatible_haps = [i]
         query_hap = set(current_hap)
         query_hap_regs = list(flattened_regions[i])
-        for j, target_hap in enumerate(haplotypes_list[i:]):
-            orig_pos = j + i
-            if orig_pos in visited: continue
+        # for j, target_hap in enumerate(haplotypes_list[i:]):
+        #     orig_pos = j + i
+        #     if orig_pos in visited: continue
+        for orig_pos, target_hap in enumerate(haplotypes_list):
+            if orig_pos == i: continue
+            
             target_hap_regs = flattened_regions[orig_pos]
             if mergeable_haplotypes(query_hap, query_hap_regs,
                                     target_hap, target_hap_regs,
@@ -141,24 +146,31 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
 
         yield [haplotypes_list[x] for x in compatible_haps], query_hap, query_hap_regs
         
-        if i % 1000 == 0:
+        if scanned == log_scanned:
+            if scanned == 0:
+                etime = time.time()-t1 # time used to process one hap
+                log_scanned = int(5 / etime)
+                print "max scan time:", etime, "logging time adjusted to show progress every ~5 secs. ", log_scanned, "haps" 
+            else: 
+                etime = (scanned/(time.time()-t1)) 
             print "     scanned:%d merged:%d, sizes:%d-%d median-size:%d time:%d/s" %(len(visited),
                                                                                        merged_haplotypes,
                                                                                        max(hap_sizes),
                                                                                        min(hap_sizes),
                                                                                        0,
-                                                                                       1000 * (time.time()-t1))
+                                                                                       etime)
             sys.stdout.flush()
             t1 = time.time()
+            scanned = 0
             #print_haplotypes(compatible_haps, haplotype2regions)
-
+        scanned += 1
 
     print "     scanned:%d merged:%d, sizes:%d-%d median-size:%d time:%d/s" %(len(visited),
                                                                               merged_haplotypes,
                                                                               max(hap_sizes),
                                                                               min(hap_sizes),
                                                                               0,
-                                                                              1000 * (time.time()-t1))
+                                                                              scanned / (time.time()-t1))
 
     #crappyhist(snp_count, max(snp_count))
     #return merged_haplotypes
@@ -194,62 +206,6 @@ def global_region(target, alleles):
                 if reg[1] > max_pos:
                     max_pos = reg[1]
     return min_pos, max_pos            
-
-    
-def view_reads(target, alleles, ref, groups=None):
-    break_points = {}
-    if groups:
-        target = []
-        for gr in groups:
-            target.extend(gr)
-            break_points[len(target)-1] = str(gr)
-    print
-    
-
-    min_pos, max_pos = global_region(target, alleles)
-    refseq = ref[min_pos:max_pos]
-    
-    lines = []
-    group_lines = []
-    group_hap = set()
-    for aindex, a in enumerate(target):
-        hap_variants = dict(a)
-        for hap in alleles[a]:
-            read_seq = [" "] * len(refseq)
-            min_read_start = None
-            for reg in hap:
-                if min_read_start is None or reg[0] < min_read_start:
-                    min_read_start = reg[0]
-                for i in xrange(min_pos, max_pos):
-                    if i>= reg[0] and i <= reg[1]:
-                        if i in hap_variants:
-                            read_seq[i - min_pos] = hap_variants[i]
-                        else:
-                            read_seq[i - min_pos] = "-"
-            group_lines.append([min_read_start, ''.join(read_seq)])
-        group_hap.add(a)
-        if aindex in break_points:
-            #group_lines.append([len(refseq), '____%s'%sorted(group_hap)+'_'*len(refseq)])
-            group_lines.append([len(refseq), '_'*len(refseq)])
-            group_lines.sort()
-            lines.append(group_lines)
-            for x in group_lines:
-                print x
-            group_lines = []
-            group_hap = set()
-
-    if group_lines:
-        group_lines.sort()
-        lines.append(group_lines)
-        
-    lines.sort()
-    flat_lines = [ln[1] for sublist in lines for ln in sublist]                     
-    hap_length = len(set([val for sublist in target for val in sublist]))
-    title = "%d:%d (%dbp), read-pairs:%d, hap_length:%d" %(min_pos, max_pos, max_pos-min_pos, len(target), hap_length)
-    
-    readview.view([refseq] + flat_lines, title)
-
-  
 
     
 def mergeable_haplotypes(a, flat_regs_a, b, flat_regs_b, snp2coverage, min_snp_coverage, min_anchoring_snps):
@@ -311,12 +267,67 @@ def print_haplotypes(alleles_group, alleles):
     print all_pos
 
 
+def view_reads(target, alleles, ref, groups=None):
+    break_points = {}
+    if groups:
+        target = []
+        for gr in groups:
+            target.extend(gr)
+            break_points[len(target)-1] = str(gr)
+    print
+    
+
+    min_pos, max_pos = global_region(target, alleles)
+    refseq = ref[min_pos:max_pos]
+    
+    lines = []
+    group_lines = []
+    group_hap = set()
+    for aindex, a in enumerate(target):
+        hap_variants = dict(a)
+        for hap in alleles[a]:
+            read_seq = [" "] * len(refseq)
+            min_read_start = None
+            for reg in hap:
+                if min_read_start is None or reg[0] < min_read_start:
+                    min_read_start = reg[0]
+                for i in xrange(min_pos, max_pos):
+                    if i>= reg[0] and i <= reg[1]:
+                        if i in hap_variants:
+                            read_seq[i - min_pos] = hap_variants[i]
+                        else:
+                            read_seq[i - min_pos] = "-"
+            group_lines.append([min_read_start, ''.join(read_seq)])
+        group_hap.add(a)
+        if aindex in break_points:
+            #group_lines.append([len(refseq), '____%s'%sorted(group_hap)+'_'*len(refseq)])
+            group_lines.append([len(refseq), '_'*len(refseq)])
+            group_lines.sort()
+            lines.append(group_lines)
+            for x in group_lines:
+                print x
+            group_lines = []
+            group_hap = set()
+
+    if group_lines:
+        group_lines.sort()
+        lines.append(group_lines)
+        
+    lines.sort()
+    flat_lines = [ln[1] for sublist in lines for ln in sublist]                     
+    hap_length = len(set([val for sublist in target for val in sublist]))
+    title = "%d:%d (%dbp), read-pairs:%d, hap_length:%d" %(min_pos, max_pos, max_pos-min_pos, len(target), hap_length)
+    readview.view([refseq] + flat_lines, title)
+
+
+    
 
 def main(args):
     for bamfile in glob(args.bamfiles):
         for taxid, contigid, paired_reads, total_reads in iter_reads_by_contig(bamfile, target_taxa=args.taxa):
-            refseq = contig_db.find_one({"sp":int(taxid), "c":contigid}, {"nt"})["nt"]
-            haplotype2regions, snp_cov = get_paired_haplotypes(paired_reads, refseq, 
+            contigseq = contig_db.find_one({"sp":int(taxid), "c":contigid}, {"nt"})["nt"]
+            print "Contig lentgh:", len(contigseq)
+            haplotype2regions, snp_cov = get_paired_haplotypes(paired_reads, contigseq, 
                                                               min_site_quality=args.min_site_quality,
                                                               min_snps_in_haplotype=args.min_snps_in_haplotype)
             merged = []
@@ -328,13 +339,10 @@ def main(args):
                 if args.view:
                     #print_haplotypes(hap_group, refseq)
                     #raw_input()
-                    view_reads(hap_group, haplotype2regions, refseq)
+                    view_reads(hap_group, haplotype2regions, contigseq)
                 
             if args.output:
                 cPickle.dump(merged, open(args.output, "w"))
-
-                
-
             
 
 if __name__ == '__main__':
@@ -344,13 +352,15 @@ if __name__ == '__main__':
     parser.add_argument('--taxa', dest="taxa", default=[None], nargs="*")
     parser.add_argument('--bam', dest="bamfiles")
     parser.add_argument('--contig', dest="contig")
-    parser.add_argument('--min_snp_coverage', dest='min_snp_coverage', default=4, type=int)
+    parser.add_argument('--min_snp_coverage', dest='min_snp_coverage', default=5, type=int)
     parser.add_argument('--min_site_quality', dest='min_site_quality', default=13, type=int)
     parser.add_argument('--min_anchoring_snps', dest='min_anchoring_snps', default=2, type=int)
     parser.add_argument('--min_snps_in_haplotype', dest='min_snps_in_haplotype', default=2, type=int)
     parser.add_argument('--output', dest='output')
     parser.add_argument('--view', dest='view', action='store_true')
     args = parser.parse_args()
+    pprint(args)
+    
     main(args)
 
 
