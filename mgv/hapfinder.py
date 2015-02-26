@@ -9,8 +9,6 @@ from pprint import pprint
 from pymongo import MongoClient
 import pysam
 
-import readview
-
 # Database pointers
 mongo = MongoClient('pc-bork62')
 snp_db =  mongo.metagenvar_filtered.snp
@@ -135,7 +133,8 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
                                     min_anchoring_snps):
 
                 # if compatible, build a merged haplotype and continue
-                # searching
+                # searching. Add also this hap to the visited list, so it will
+                # not be used as seed hap.
                 visited.add(orig_pos)
                 query_hap.update(target_hap)
                 query_hap_regs.extend(target_hap_regs)
@@ -268,6 +267,8 @@ def print_haplotypes(alleles_group, alleles):
 
 
 def view_reads(target, alleles, ref, groups=None):
+    import readview
+    
     break_points = {}
     if groups:
         target = []
