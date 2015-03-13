@@ -180,11 +180,11 @@ class SeqView(npyscreen.MultiLine):
         return npyscreen.MultiLine.display_value(self, trimmed_line)
         
     def move_right(self, x):
-        self.cursor_pos = min(self.max_length, self.cursor_pos + 10)
+        self.cursor_pos = min(self.max_length, self.cursor_pos + 1)
         self.update(clear=True)
 
     def move_left(self, x):
-        self.cursor_pos = max(0, self.cursor_pos -10)
+        self.cursor_pos = max(0, self.cursor_pos -1)
         self.update(clear=True)
         
     def move_up(self, x):
@@ -225,7 +225,6 @@ class ReadViewApp(npyscreen.NPSApp):
                             curses.KEY_LEFT: t3.move_left,
                             curses.KEY_UP: t3.move_up,
                             curses.KEY_DOWN: t3.move_down,
-
                             
                             ord('q'): clean_exit})
         F.edit()
