@@ -88,13 +88,13 @@ class ReadString(npyscreen.FixedText):
                         elif chunk[0] == " ":
                             offset += len(chunk)
                             continue
-                        elif chunk == "A":
+                        elif chunk.startswith("A"):
                             pair = self.parent.theme_manager.get_pair_number("RED_BLACK")
-                        elif chunk == "C":
+                        elif chunk.startswith("C"):
                             pair = self.parent.theme_manager.get_pair_number("YELLOW_BLACK")
-                        elif chunk == "T":
+                        elif chunk.startswith("T"):
                             pair = self.parent.theme_manager.get_pair_number("CYAN_BLACK")
-                        elif chunk == "G":
+                        elif chunk.startswith("G"):
                             pair = self.parent.theme_manager.get_pair_number("GREEN_BLACK")
                         else:
                             pair = self.parent.theme_manager.get_pair_number("WHITE_BLACK")
@@ -158,13 +158,13 @@ class SeqView(npyscreen.MultiLine):
                     pair = blank
                 elif chunk[0] == "_":
                     pair = yellow
-                elif chunk == "A":
+                elif chunk[0] == "A":
                     pair = red if not hl else h_red
-                elif chunk == "C":
+                elif chunk[0] == "C":
                     pair = yellow if not hl else h_yellow
-                elif chunk == "T":
+                elif chunk[0] == "T":
                     pair = cyan if not hl else h_cyan
-                elif chunk == "G":
+                elif chunk[0] == "G":
                     pair = green if not hl else h_green
                 else:
                     pair = white if not hl else h_white
@@ -236,7 +236,8 @@ def view(values, title):
         
 if __name__ == "__main__":
     import random
-    S = ["A", "C", "T", "G"] 
+    S = ["A", "C", "T", "G"]
+        
     refseq = ''.join([S[random.randint(0, len(S)-1)] for i in xrange(5000)])
 
     temp_values = [refseq, refseq, refseq, refseq, refseq]

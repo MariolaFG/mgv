@@ -1,3 +1,5 @@
+import ipdb
+
 import sys
 import os
 from glob import glob
@@ -9,6 +11,9 @@ from pprint import pprint
 #import numpy
 from pymongo import MongoClient
 import pysam
+import logging
+logging.basicConfig()
+log = logging.getLogger()
 
 # Database pointers
 mongo = MongoClient('pc-bork62')
@@ -21,18 +26,28 @@ contig_db = mongo.ref9.contigs
 def iter_reads_by_contig(bamfile, target_taxa=None, target_region=None):
     print "Loading reads..."
     bam = pysam.AlignmentFile(bamfile, "rb" )
+    
     if target_region:
-        contigs = [target_region[0]]
-        start = target_region[1]
-        end = target_region[2]
+        if target_region[0] is None:
+            contigs = bam.references
+            start = None
+            end = None
+        else:
+            contigs = [target_region[0]]
+            start = target_region[1]
+            end = target_region[2]
     else:
         contigs = bam.references
         start = None
         end = None
-        
-
+    print contigs
+    
     for i, ctg in enumerate(contigs):
-        taxid, cid = ctg.split(".", 1)
+        if target_taxa:
+            taxid, cid = ctg.split(".", 1)
+        else:
+            taxid, cid = None, ctg
+            
         # Skip contigs from unwanted species
         if target_taxa and taxid not in target_taxa:
             continue
@@ -45,6 +60,15 @@ def iter_reads_by_contig(bamfile, target_taxa=None, target_region=None):
         print "reads:"
         print bam.count(ctg, start, end)
         sys.stdout.flush()
+
+        log.info("Loading site coverage...")
+        cov = defaultdict(int)
+        for col in bam.pileup(ctg, start, end):
+            for pileupread in col.pileups:
+                nt = pileupread.alignment.query_sequence[pileupread.query_position]  
+                cov[(col.pos, nt)] += 1
+        log.info("Loading read content...")
+       
         for read in bam.fetch(ctg, start, end):
             # if the read matches several blocks, skip it for now: probably
             # pointing to an indel
@@ -56,9 +80,9 @@ def iter_reads_by_contig(bamfile, target_taxa=None, target_region=None):
             total_reads += 1
             
         if paired_reads:
-            yield taxid, cid, paired_reads, total_reads 
+            yield taxid, cid, paired_reads, total_reads, cov 
     
-def get_paired_haplotypes(paired_reads, refseq, min_site_quality, min_snps_in_haplotype):
+def get_paired_haplotypes(paired_reads, refseq, coverage, min_snp_coverage, min_site_quality, min_snps_in_haplotype):
     haplotypes = defaultdict(list)
     snp_coverage = defaultdict(int)
     for nread, read_pair in enumerate(paired_reads.itervalues()):
@@ -71,7 +95,8 @@ def get_paired_haplotypes(paired_reads, refseq, min_site_quality, min_snps_in_ha
                 print "\r   reads:% 8d" %(nread),
             sys.stdout.flush()
 
-        # build paired haplotypes    
+        # build paired haplotypes. Pysam loaded read 0-based positions, so we
+        # can directly compare to refseq string
         read_snps = []
         covered_regions = []
         for read in read_pair:
@@ -79,8 +104,9 @@ def get_paired_haplotypes(paired_reads, refseq, min_site_quality, min_snps_in_ha
             for i, nt in enumerate(read.query_alignment_sequence):
                 if nt != seq[i] and read.query_qualities[i] >= min_site_quality:
                     genomic_coord = i + read.reference_start
-                    read_snps.append( (genomic_coord, nt) )
                     snp_coverage[ (genomic_coord, nt) ] += 1
+                    if coverage[(genomic_coord, nt)] >= min_snp_coverage:
+                        read_snps.append( (genomic_coord, nt) )
             covered_regions.append((read.reference_start, read.reference_end, read.qname))
             
         if len(read_snps) > min_snps_in_haplotype:
@@ -94,6 +120,8 @@ def get_paired_haplotypes(paired_reads, refseq, min_site_quality, min_snps_in_ha
     print "\r   reads:% 8d, haplotypes:% 5d, max-haplotype-size:% 2d, unique-snps:% 7d" %\
         (nread, len(haplotypes), max([0] + [len(s) for s in haplotypes]), len(snp_coverage)),
     print
+    
+    
     return haplotypes, snp_coverage
     
 def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anchoring_snps):
@@ -140,45 +168,46 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
         if i in visited: continue
         
         visited.add(i)
-        
+        log.debug('using %s as seed' %(haplotypes_list[i]))
         compatible_haps = [i]
         query_hap = set(current_hap)
         query_hap_regs = list(flattened_regions[i])
-        # for j, target_hap in enumerate(haplotypes_list[i:]):
-        #     orig_pos = j + i
-        #     if orig_pos in visited: continue
         target_visited = set()
-        last_pos = 0
-        while last_pos+1 < len(haplotypes_list):
-            for orig_pos, target_hap in enumerate(haplotypes_list):
-                last_pos = orig_pos
-                if orig_pos == i: continue # do not merged with itself
-                if orig_pos in target_visited: continue 
-                if orig_pos in visited: continue ###################
+        retry = True
+        while retry:
+            retry = False
+            for j, target_hap in enumerate(haplotypes_list):
+                if j == i: continue # do not merged with itself
+                if j in target_visited: continue 
+                if j in visited: continue ###################
 
-                target_hap_regs = flattened_regions[orig_pos]
+                target_hap_regs = flattened_regions[j]
                 if mergeable_haplotypes(query_hap, query_hap_regs,
                                         target_hap, target_hap_regs,
                                         snp2coverage, 
                                         min_snp_coverage,
                                         min_anchoring_snps):
-
+                    log.debug('  Merged with %s' %target_hap)
                     # if compatible, build a merged haplotype and continue
                     # searching. Add also this hap to the visited list, so it will
                     # not be used as seed hap.
-                    visited.add(orig_pos)
+                    visited.add(j)
                     query_hap.update(target_hap)
                     query_hap_regs.extend(target_hap_regs)
-                    compatible_haps.append(orig_pos)
+                    compatible_haps.append(j)
 
-                    target_visited.add(orig_pos)
-                    break
-
-                
+                    target_visited.add(j)
+                    log.debug('  found mergeable %s ' %(haplotypes_list[j]))
+                    retry = True
+                    #break
+                    
+                        
         merged_haplotypes += 1
         hap_sizes.append(len(query_hap))
-        
-        yield [haplotypes_list[x] for x in compatible_haps], query_hap, query_hap_regs
+        hap_group = [haplotypes_list[x] for x in compatible_haps]
+        #if len(hap_group) > 1:
+        #    print_hap_group(hap_group)
+        yield hap_group, query_hap, query_hap_regs
         
         if scanned == log_scanned:
             if scanned == 0:
@@ -194,7 +223,7 @@ def merge_haplotypes(haplotype2regions, snp2coverage, min_snp_coverage, min_anch
                                                                                        0,
                                                                                        etime)
             sys.stdout.flush()
-            t1 = time.time()
+            t1 = time.time() - 0.00001
             scanned = 0
             #print_haplotypes(compatible_haps, haplotype2regions)
         scanned += 1
@@ -255,13 +284,16 @@ def mergeable_haplotypes(a, flat_regs_a, b, flat_regs_b, snp2coverage, min_snp_c
     '''Returns True if two haplotypes (composed of a series of SNP coords) could be
     merged, meaning that they are probably from the same DNA fragment.
     '''
-    
+    log.debug(" Comparing %s vs %s" %(a, b))
     # builds a list of snps present both in a and b haplotypes
-    common_snps = [snp for snp in a & b if snp2coverage[snp] >= min_snp_coverage]
-    if len(common_snps) and (len(b) == len(common_snps) or len(a) == len(common_snps)):
-        #if one haplotype is contained in the other, the can safely be merged
-        return True        
-    elif len(common_snps) < min_anchoring_snps:
+    common_snps = [snp for snp in a & b if snp2coverage[snp]] # >= min_snp_coverage]
+    
+    #if len(common_snps) and (len(b) == len(common_snps) or len(a) == len(common_snps)):
+        #if one haplotype is contained in the other, they can safely be merged
+    #    log.debug(" ACCEPT: compatible NO new SNPs")
+    #    return True        
+    if len(common_snps) < min_anchoring_snps and a^b:
+        log.debug(" DISCARD: Not enough anchoring points to join %s" %len(common_snps))
         # if they contribute different snps, but share less and the anchoring thr, cannot be merged 
         return False
     else:
@@ -275,6 +307,7 @@ def mergeable_haplotypes(a, flat_regs_a, b, flat_regs_b, snp2coverage, min_snp_c
         for unique_a in a - b:
             for rb in flat_regs_b:
                 if snp_contined_in_region(unique_a[0], rb):
+                    log.debug(" DISCARD: contradicting (B) regions: %s in %s" %(unique_a[0], rb))
                     return False
                 #if overlap_reg((unique_a[0], unique_a[0]), rb):
                 #    return False
@@ -282,9 +315,12 @@ def mergeable_haplotypes(a, flat_regs_a, b, flat_regs_b, snp2coverage, min_snp_c
         for unique_b in b - a:
             for ra in flat_regs_a:
                 if snp_contined_in_region(unique_b[0], ra):
+                    log.debug(" DISCARD: contradicting (A) regions: %s in %s" %(unique_b[0], ra))
                     return False
                 #if overlap_reg((unique_b[0], unique_b[0]), ra):
                 #    return False
+
+    log.debug(" ACCEPT: new snps added")
     return True
 
 def print_haplotypes(alleles_group, alleles):
@@ -366,18 +402,21 @@ def view_reads(target, alleles, ref, groups=None):
     title = "%d:%d (%dbp), read-pairs:%d, hap_length:%d" %(min_pos, max_pos, max_pos-min_pos, len(target), hap_length)
     readview.view([refseq] + flat_lines, title)
 
-def print2(hap_groups):
+def print_hap_group(hap_groups):
     all_snps = set()
     for hap in hap_groups:
         all_snps.update(hap)
     for hap in hap_groups:
         for snp in sorted(all_snps):
             if snp in hap:
-                print "% 5d-%s" %(snp[0], snp[1]),
+                #print "% 5d-%s" %(snp[0], snp[1]),
+                print snp[1],
             else:
-                print "% 5d- " %(snp[0]),
+                print " ",
         print
+      
 
+        
 def merged_snps(hap_groups):
     all_snps = set()
     for hap in hap_groups:
@@ -393,9 +432,18 @@ def clean_lines(lines):
         if column_chars - skiplable:
             for i, newl in enumerate(new_lines):
                 new_lines[i] += lines[i][pos]
-    return new_lines
+
+    master_line = []
+    for pos in xrange(len(new_lines[0])):
+        column_chars = set([ln[pos] for ln in new_lines[1:] if not ln.startswith(">") and ln[pos] != ' '])
+        if len(column_chars) > 1:
+            master_line.append(str(len(column_chars)))
+        else:
+            master_line.append('.')
+    #new_lines.append(''.join(master_line))
+    return new_lines, ''.join(master_line)
     
-def view_reads2(hap_blocks, contigseq, show_grouped=True):
+def view_reads2(hap_blocks, contigseq, show_grouped=True, snp_only=False, cid=""):
     import readview
 
     global_start = len(contigseq)
@@ -405,111 +453,196 @@ def view_reads2(hap_blocks, contigseq, show_grouped=True):
         min_pos, max_pos = global_region(hap_group, hap2regions)
         global_start = min(min_pos, global_start)
         global_end = max(global_end, max_pos)
+
     print global_start, global_end
     
-    refseq = contigseq[global_start:global_end + 1]
+    refseq = contigseq[global_start:global_end+1]
     all_lines = [refseq]
-    for hap_group, hap2regions, title in hap_blocks:
-        title = '> %s (%d read pairs) - (%d snps)' %(title, len(hap_group), len(merged_snps(hap_group)))
-        hap_group_lines = []
-        if show_grouped:
+
+    if show_grouped:
+        for hap_group, hap2regions, title in hap_blocks:
+            title = '> %s (%d read pairs) - (%d snps)' %(title, len(hap_group), len(merged_snps(hap_group)))
             line = [' '] * len(refseq)
-        for hap in hap_group:
-            for reg in hap2regions[hap]:
-                if not show_grouped:
+            for hap in hap_group:
+                for reg in hap2regions[hap]:
+                    for read_pair in reg:
+                        for i in xrange(read_pair[0], read_pair[1] + 1):
+                            if i >= global_start and i<= global_end:
+                                if line[i - global_start] == ' ':
+                                    line[i - global_start] = '-'
+                for pos, nt in hap:
+                    line[pos - global_start] = nt
+            all_lines.append(''.join(line))
+    else:
+        for hap_group, hap2regions, title in hap_blocks:
+            title = '> %s (%d read pairs) - (%d snps)' %(title, len(hap_group), len(merged_snps(hap_group)))
+            hap_group_lines = []
+            for hap in hap_group:
+                for reg in hap2regions[hap]:
                     line = [' '] * len(refseq)
-                for read_pair in reg:
-                    read_start = read_pair[0] - global_start
-                    read_end = read_pair[1] - global_start
-                    line[read_start:read_end] = ['-'] * (read_end-read_start)
-                for pos, letter in hap:
-                    line[pos - global_start] = letter
-                
-                if not show_grouped:
+                    for read_pair in reg:
+                        read_start = read_pair[0] - global_start
+                        read_end = read_pair[1] - global_start
+                        line[read_start:read_end] = ['-'] * (read_end - read_start + 1)
+
+                    for pos, letter in hap:
+                        line[pos - global_start] = letter
                     hap_group_lines.append(''.join(line))
-        if show_grouped:
-            hap_group_lines.append(''.join(line))
-        #print2(hap_group)
-        hap_group_lines.sort()
-        title = [title+str('_'*(len(refseq)-len(title)))]
-        all_lines.extend(hap_group_lines)
-    all_lines = clean_lines(all_lines)
-    readview.view(sorted(all_lines, reverse=True), "blablbas")
+
+            hap_group_lines.sort()
+            hap_group_lines.append('>'+'_'*len(line))
+            all_lines.extend(hap_group_lines)
+        
+    if snp_only: 
+        new_lines, master_line = clean_lines(all_lines)
+        header = [new_lines[0], master_line]
+        target_lines = new_lines[1:]
+    else:
+        ruler = ''.join(["|" if not x%10 else " " for x in xrange(1, len(all_lines[0]))])
+        header = [ruler, all_lines[0]]
+        target_lines = all_lines[1:]
+       
+    if show_grouped:
+        target_lines.sort(reverse=True)
+    readview.view(header + target_lines, "%s:%d-%d: %d merged read pairs, %d total SNPs." %(cid,global_start, global_end, len(hap_group), len(merged_snps(hap_group))))
+
     return 
    
-
 def main(args):
     if len(args.bamfiles) == 1:
         target_bamfiles = glob(args.bamfiles[0])
     else:
         target_bamfiles = args.bamfiles
 
-    target_region_haps = []
-    
-    for bamfile in target_bamfiles:
-        for taxid, contigid, paired_reads, total_reads in iter_reads_by_contig(bamfile, target_taxa=args.taxa, target_region=args.target_region):
-            contigseq = contig_db.find_one({"sp":int(taxid), "c":contigid}, {"nt"})["nt"]
-            print "Contig lentgh:", len(contigseq)
-
-            gene_coords = None
-            if args.gene_snps_only:
-                print 'loading gene coords...'
-                gene_coords = []
-                for g in gene_db.find({"sp":int(taxid), "c":contigid}, {"n":1, "s":1, "e":1}):
-                    gene_coords.append([g["s"], g["e"], g["n"]])
-                print len(gene_coords)
-            haplotype2regions, snp_cov = get_paired_haplotypes(paired_reads, contigseq, 
-                                                              min_site_quality=args.min_site_quality,
-                                                              min_snps_in_haplotype=args.min_snps_in_haplotype)
-
-            if gene_coords:
-                print 'filtering snps outside gene regions'
-                new_hap2regions = {}
-                for i, hap in enumerate(haplotype2regions):
-                    selected_snps = []
-                    print '\r% 6d/% 6d' %(i, len(haplotype2regions)),
-                    sys.stdout.flush()
-                    for s in hap:
-                        for g in gene_coords:
-                            if s[0] < g[0]: 
-                                break # gene_coord should be sorted in ascending orther
-                            if snp_contined_in_region(s[0], g[0:2]):
-                                selected_snps.append(s)
-                                break
-                        if len(selected_snps) == len(hap):
-                            new_hap2regions[hap] = haplotype2regions[hap]
-
-                print '\n%d haplotypes selected out of %d' %(len(new_hap2regions), len(haplotype2regions))
-                haplotype2regions = new_hap2regions
-                                
-            merged = []
-            for hap_group, merged_snps, flatten_regs in merge_haplotypes(haplotype2regions, snp_cov,
-                                                                         min_anchoring_snps=args.min_anchoring_snps,
-                                                                         min_snp_coverage=args.min_snp_coverage):
-                merged.append([hap_group, merged_snps, flatten_regs])
-
-                if args.view and len(merged_snps) >= args.view:
-                    #print_haplotypes(hap_group, refseq)
-                    #raw_input()
-                    if args.target_region:
-                        target_region_haps.append([hap_group, haplotype2regions, bamfile])
-                    else:
-                        view_reads(hap_group, haplotype2regions, contigseq)
+    for reg in args.target_regions:
+        target_region_haps = defaultdict(list)
+        for bamfile in target_bamfiles:
+            # Iterate over groups of paired reads
+            
+            for taxid, contigid, paired_reads, total_reads, cov in iter_reads_by_contig(bamfile, target_taxa=args.taxa, target_region=reg):
+                print 'contig:', contigid, taxid
+                if args.refseqs:
+                    contigseq = args.refseqs.get_seq(contigid)
+                   
+                else:
+                    contigseq = contig_db.find_one({"sp":int(taxid), "c":contigid}, {"nt"})["nt"]
+                print "Contig lentgh:", len(contigseq)
                 
-            if args.output:
-                cPickle.dump(merged, open(args.output, "w"))
                 
-    if args.target_region and args.view:
-        view_reads2(target_region_haps, contigseq)
-    
+                # generate basic haplotypes based on paired reads containing a minimum number of snps. 
+                haplotype2regions, snp_cov = get_paired_haplotypes(paired_reads, contigseq, cov,
+                                                                   min_snp_coverage=args.min_snp_coverage,
+                                                                   min_site_quality=args.min_site_quality,
+                                                                   min_snps_in_haplotype=args.min_snps_in_haplotype)
 
+                gene_coords = None
+                if args.gene_snps_only:
+                    print 'Loading gene coords...'
+                    gene_coords = []
+                    for g in gene_db.find({"sp":int(taxid), "c":contigid}, {"n":1, "s":1, "e":1}):
+                        gene_coords.append([g["s"], g["e"], g["n"]])
+                    print len(gene_coords)
+                
+                    print 'filtering snps outside gene regions'
+                    new_hap2regions = {}
+                    for i, hap in enumerate(haplotype2regions):
+                        selected_snps = []
+                        print '\r% 6d/% 6d' %(i, len(haplotype2regions)),
+                        sys.stdout.flush()
+                        for s in hap:
+                            for g in gene_coords:
+                                if s[0] < g[0]: 
+                                    break # gene_coord should be sorted in ascending orther
+                                if snp_contined_in_region(s[0], g[0:2]):
+                                    selected_snps.append(s)
+                                    break
+                            if len(selected_snps) == len(hap):
+                                new_hap2regions[hap] = haplotype2regions[hap]
+
+                    print '\n%d haplotypes selected out of %d' %(len(new_hap2regions), len(haplotype2regions))
+                    haplotype2regions = new_hap2regions
+
+                # merges paried-haplotypes based non-conflicting overlaping snps
+                # from different reads.
+                merged = []
+                for hap_group, merged_snps, flatten_regs in merge_haplotypes(haplotype2regions, snp_cov,
+                                                                             min_anchoring_snps=args.min_anchoring_snps,
+                                                                             min_snp_coverage=args.min_snp_coverage):
+
+                    if len(hap_group):
+                        merged.append([hap_group, merged_snps, flatten_regs])
+                        if args.view and len(merged_snps) >= args.view:
+                            view_reads2([[hap_group, haplotype2regions, bamfile]], contigseq, show_grouped=False, snp_only=True, cid=contigid)
+                        if args.groupedview and len(merged_snps) >= args.groupedview:
+                            target_region_haps[(len(contigseq), contigid, contigseq)].append([hap_group, haplotype2regions, bamfile])
+            
+                if args.output:
+                    cPickle.dump(merged, open(args.output, "w"))
+                
+            if args.groupedview:
+                for (clen, cid, cseq), region_haps in sorted(target_region_haps.items(), reverse=True, cmp=lambda x,y: cmp(x[0][0], y[0][0])):
+                    #get_master_haplotype(region_haps)
+                    view_reads2(region_haps, cseq, show_grouped=True, cid=cid, snp_only=True)
+
+def get_master_haplotype(hap_groups_in_region):
+    #    ipdb.set_trace()
+    counter = defaultdict(set)
+    flat = []
+    for hap_group, regions, _ in hap_groups_in_region:
+        flat.extend(hap_group)
+        for hap in hap_group:
+            snp_pos = set([snp[0] for snp in hap])
+            for regs in regions[hap]:
+                for r in regs:
+                    for i in xrange(r[0], r[1]+1):
+                        if i not in snp_pos:
+                            counter[i].add('-')
+            for snp in hap:
+                counter[snp[0]].add(snp[1])
+    print_hap_group(flat)
+    
+    master_line = ''.join(["." if pos[1]==1 else str(pos[1]) for pos in sorted([(pos, len(v)) for pos,v in counter.iteritems() if len(v)>1 or '-' not in v ])])
+    print master_line
+    return counter
+      
+
+                    
+
+def test():
+    test_contig = "GAAAAAAAAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAG"    
+    test_hap2regions = {
+        frozenset([(0, "C"), (9, "T"), (19, "G")]): [ [(0, 13), (17, 24)] , [(1, 32)] ],
+        frozenset([(0, "C"), (9, "T"), (39, "C")]): [ [(0, 19), (22, 40)] ],
+        frozenset([(30, "C"), (35, "G")]): [ [(20, 60), (21, 54)] , [(20, 60)] ]
+    }
+    test_snp2coverage = defaultdict(lambda:100)
+    target_region_haps = defaultdict(list)
+    for hap_group, merged_snps, flat_regs in  merge_haplotypes(test_hap2regions, test_snp2coverage, 10, 2):
+        #view_reads2([[hap_group, test_hap2regions, "test example"]],
+        #            test_contig, show_grouped=False, snp_only=False, cid="test")
+        target_region_haps[(len(test_contig), "test", test_contig)].append([hap_group, test_hap2regions, "test contig"])
+
+    raw_input()
+        
+    for (clen, cid, cseq), region_haps in sorted(target_region_haps.items(), reverse=True, cmp=lambda x,y: cmp(x[0][0], y[0][0])):
+        view_reads2(region_haps, cseq, show_grouped=False, cid=cid, snp_only=False)
+        #view_reads2(region_haps, cseq, show_grouped=True, cid=cid, snp_only=True)
+    
+                    
 if __name__ == '__main__':
+    
+    if len(sys.argv) == 2 and sys.argv[1] == "test":
+        log.setLevel(level=logging.DEBUG)
+        test()
+        sys.exit(0)
+    
     # GENERAL CONFIG
     parser = ArgumentParser()
-    parser.add_argument('--debug', dest="debug")
-    parser.add_argument('--taxa', dest="taxa", default=[None], nargs="*")
+    parser.add_argument('--debug', dest="debug", action="store_true")
+    parser.add_argument('--taxa', dest="taxa", default=[], nargs="*")
     parser.add_argument('--bam', dest="bamfiles", nargs='+')
-    parser.add_argument('--target_region', dest='target_region', type=str)
+    parser.add_argument('--target_regions', dest='target_regions', type=str, nargs="+")
+    parser.add_argument('--target_genes', dest='target_genes', type=str, nargs="+")
     parser.add_argument('--contig', dest="contig")
     parser.add_argument('--min_snp_coverage', dest='min_snp_coverage', default=5, type=int)
     parser.add_argument('--min_site_quality', dest='min_site_quality', default=13, type=int)
@@ -517,23 +650,45 @@ if __name__ == '__main__':
     parser.add_argument('--min_snps_in_haplotype', dest='min_snps_in_haplotype', default=2, type=int)
     parser.add_argument('--output', dest='output')
     parser.add_argument('--view', dest='view', type=int)
+    parser.add_argument('--groupedview', dest='groupedview', type=int)
     parser.add_argument('--gene_snps_only', dest='gene_snps_only', action='store_true')
+    parser.add_argument('--refseqs', dest='refseqs', type=str)
     args = parser.parse_args()
 
-    if args.target_region:
-        try:
-            contig, raw_pos = args.target_region.split(':')
-            args.target_region = [contig.strip()] + map(int, raw_pos.split('-'))
-        except Exception:
-            print >>sys.stderr, 'ERROR: Invalid contig region. Use contigid:start-end syntax\n'
-            raise
-        print args.target_region
+    if args.debug:
+        log.setLevel(level=logging.DEBUG)
+    
+    if args.target_regions:
+        regions = []
+        for reg in args.target_regions:
+            try:
+                contig, raw_pos = reg.split(':')
+                if not raw_pos:
+                    start, end = None, None
+                else:
+                    start, end = map(int, raw_pos.split('-'))
+                regions.append([contig.strip(), start, end])
+            except Exception:
+                print >>sys.stderr, 'ERROR: Invalid contig region. Use contigid:start-end syntax\n'
+                raise
+        args.target_regions = regions
         
+    if args.target_genes:
+        # extract region of genes and add it to target_regions
+        pass
+
+    if not args.target_regions:
+        # If not regions requested, scan all contigs completely 
+        args.target_regions = [ [None, None, None] ]
+
+    if args.refseqs:
+        from ete2 import SeqGroup
+        args.refseqs = SeqGroup(args.refseqs)
+                
     if args.output and os.path.exists(args.output):
         print 'Output file exits. Skipping'
     else:
         main(args)
 
 
-    
 
